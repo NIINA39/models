@@ -198,3 +198,207 @@ class LogLossMeanBaseline(tf_keras.metrics.Metric):
   @classmethod
   def from_config(cls, config: dict[str, Any]) -> LogLossMeanBaseline:
     return cls(**config)
+
+
+class LogLossMinimum(tf_keras.metrics.Metric):
+  """Computes the minimum achievable (weighted) poisson log loss.
+
+  Given labels `y` and the model's predictions `x`, the minimum loss is obtained
+  when `x` equals `y`. In this case the loss is computed as:
+  `loss = y - y * log(y) + [y * log(y) - y + 0.5 * log(2 * pi * y)]`
+
+  Note that `[y * log(y) - y + 0.5 * log(2 * pi * y)]` is only computed if
+  `compute_full_loss` is set to `True`.
+  """
+
+  def __init__(
+      self,
+      compute_full_loss: bool = False,
+      slice_by_treatment: bool = True,
+      name: str = "poisson_log_loss_minimum",
+      dtype: tf.DType = tf.float32,
+  ):
+    """Initializes the instance.
+
+    Args:
+      compute_full_loss: Specifies whether to compute the full minimum log loss
+        or not. Defaults to `False`.
+      slice_by_treatment: Specifies whether the loss should be sliced by the
+        treatment indicator tensor. If `True`, the metric's result will return
+        the loss values sliced by the treatment group. Note that this can only
+        be set to `True` when `y_pred` is of type `TwoTowerTrainingOutputs`.
+      name: Optional name for the instance.
+      dtype: Optional data type for the instance.
+    """
+    super().__init__(name=name, dtype=dtype)
+
+    if compute_full_loss:
+      raise NotImplementedError("Full loss computation is not yet supported.")
+
+    self._compute_full_loss = compute_full_loss
+    self._slice_by_treatment = slice_by_treatment
+
+    if slice_by_treatment:
+      self._loss = treatment_sliced_metric.TreatmentSlicedMetric(
+          metric=tf_keras.metrics.Mean(name=name, dtype=dtype)
+      )
+    else:
+      self._loss = tf_keras.metrics.Mean(name=name, dtype=dtype)
+
+  def update_state(
+      self,
+      y_true: tf.Tensor,
+      y_pred: types.TwoTowerTrainingOutputs | tf.Tensor | None = None,
+      sample_weight: tf.Tensor | None = None,
+  ):
+    is_treatment = {}
+    if self._slice_by_treatment:
+      if not isinstance(y_pred, types.TwoTowerTrainingOutputs):
+        raise ValueError(
+            "`slice_by_treatment` must be set to `False` when `y_pred` is not"
+            " of type `TwoTowerTrainingOutputs`."
+        )
+      is_treatment["is_treatment"] = y_pred.is_treatment
+
+    self._loss.update_state(
+        _safe_x_minus_xlogx(y_true), sample_weight=sample_weight, **is_treatment
+    )
+
+  def result(self) -> tf.Tensor | dict[str, tf.Tensor]:
+    return self._loss.result()
+
+  def get_config(self) -> dict[str, Any]:
+    config = super().get_config()
+    config["compute_full_loss"] = self._compute_full_loss
+    config["slice_by_treatment"] = self._slice_by_treatment
+    return config
+
+  @classmethod
+  def from_config(cls, config: dict[str, Any]) -> LogLossMinimum:
+    return cls(**config)
+
+
+class PseudoRSquared(tf_keras.metrics.Metric):
+  """Computes the pseudo R-squared metric for poisson regression.
+
+  The pseudo R-squared is computed from log likelihoods of three models:
+  1) LLbaseline: log likelihood of a mean baseline predictor.
+  2) LLfit: log likelihood of the fitted model.
+  3) LLmax: maximum achievable log likelihood, which occurs when the predictions
+  equal to the labels.
+
+  The equation that computes the pseudo R-squared is:
+  >>> R_squared = (LLfit - LLbaseline) / (LLmax - LLbaseline)
+  """
+
+  def __init__(
+      self,
+      from_logits: bool = True,
+      slice_by_treatment: bool = True,
+      name: str = "pseudo_r_squared",
+      dtype: tf.DType = tf.float32,
+  ):
+    """Initializes the instance.
+
+    Args:
+      from_logits: When `y_pred` is of type `tf.Tensor`, specifies whether
+        `y_pred` represents the model's logits or predictions. Otherwise, when
+        `y_pred` is of type `TwoTowerTrainingOutputs`, set this to `True` in
+        order to compute the loss using the true logits.
+      slice_by_treatment: Specifies whether the loss should be sliced by the
+        treatment indicator tensor. If `True`, the metric's result will return
+        the loss values sliced by the treatment group. Note that this can only
+        be set to `True` when `y_pred` is of type `TwoTowerTrainingOutputs`.
+      name: Optional name for the instance.
+      dtype: Optional data type for the instance.
+    """
+    super().__init__(name=name, dtype=dtype)
+
+    self._from_logits = from_logits
+    self._slice_by_treatment = slice_by_treatment
+
+    # Since log_loss = -1 * log_likelihood we can just accumulate the losses.
+    loss = LogLoss(
+        from_logits=from_logits,
+        compute_full_loss=False,
+        slice_by_treatment=False,
+        name=name,
+        dtype=dtype,
+    )
+    minimum_loss = LogLossMinimum(
+        compute_full_loss=False,
+        slice_by_treatment=False,
+        name=name,
+        dtype=dtype,
+    )
+    mean_baseline_loss = LogLossMeanBaseline(
+        compute_full_loss=False,
+        slice_by_treatment=False,
+        name=name,
+        dtype=dtype,
+    )
+
+    if slice_by_treatment:
+      self._model_loss = treatment_sliced_metric.TreatmentSlicedMetric(
+          metric=loss
+      )
+      self._minimum_loss = treatment_sliced_metric.TreatmentSlicedMetric(
+          metric=minimum_loss
+      )
+      self._mean_baseline_loss = treatment_sliced_metric.TreatmentSlicedMetric(
+          metric=mean_baseline_loss
+      )
+    else:
+      self._model_loss = loss
+      self._minimum_loss = minimum_loss
+      self._mean_baseline_loss = mean_baseline_loss
+
+  def update_state(
+      self,
+      y_true: tf.Tensor,
+      y_pred: types.TwoTowerTrainingOutputs | tf.Tensor,
+      sample_weight: tf.Tensor | None = None,
+  ):
+    is_treatment = {}
+    if self._slice_by_treatment:
+      if not isinstance(y_pred, types.TwoTowerTrainingOutputs):
+        raise ValueError(
+            "`slice_by_treatment` must be set to `False` when `y_pred` is not"
+            " of type `TwoTowerTrainingOutputs`."
+        )
+      is_treatment["is_treatment"] = y_pred.is_treatment
+
+    self._model_loss.update_state(
+        y_true, y_pred=y_pred, sample_weight=sample_weight, **is_treatment
+    )
+    self._minimum_loss.update_state(
+        y_true, y_pred=y_pred, sample_weight=sample_weight, **is_treatment
+    )
+    self._mean_baseline_loss.update_state(
+        y_true, y_pred=y_pred, sample_weight=sample_weight, **is_treatment
+    )
+
+  def result(self) -> tf.Tensor | dict[str, tf.Tensor]:
+    def _pseudo_r_squared(
+        loss_model: tf.Tensor, loss_baseline: tf.Tensor, loss_min: tf.Tensor
+    ) -> tf.Tensor:
+      return tf.math.divide_no_nan(
+          loss_model - loss_baseline, loss_min - loss_baseline
+      )
+
+    return tf.nest.map_structure(
+        _pseudo_r_squared,
+        self._model_loss.result(),
+        self._mean_baseline_loss.result(),
+        self._minimum_loss.result(),
+    )
+
+  def get_config(self) -> dict[str, Any]:
+    config = super().get_config()
+    config["from_logits"] = self._from_logits
+    config["slice_by_treatment"] = self._slice_by_treatment
+    return config
+
+  @classmethod
+  def from_config(cls, config: dict[str, Any]) -> PseudoRSquared:
+    return cls(**config)
